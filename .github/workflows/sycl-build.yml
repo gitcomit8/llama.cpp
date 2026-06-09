@@ -1,10 +1,10 @@
-name: Windows SYCL On-Demand Build
+name: Windows SYCL On-Demand Release Build
 
 on:
   workflow_dispatch:
     inputs:
       build_type:
-        description: 'Build configuration type'
+        description: 'Build configuration type (Note: win-build-sycl.bat defaults to Release, this controls artifact staging)'
         required: true
         default: 'Release'
         type: choice
@@ -12,43 +12,90 @@ on:
         - Release
         - Debug
 
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_ARG_LOG_COLORS: 1
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
+  WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
+  WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
+  LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-win-sdk-1.28.2.zip
+  ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
+  ONEAPI_INSTALLER_VERSION: "2025.3.3"
+
 jobs:
-  build-sycl-windows:
-    runs-on: windows-latest
+  windows-latest-sycl-ondemand:
+    runs-on: windows-2022
 
     steps:
-    - name: Clone Repository
-      uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
 
-    - name: Install Intel oneAPI Base Toolkit
-      run: |
-        # Download and silently install the minimal components needed for DPCPP/SYCL
-        invoke-webrequest -Uri "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/204cb080-6bc7-4d6d-bfda-96695286596a/w_BaseKit_p_2024.1.0.596_offline.exe" -OutFile "oneapi_base.exe"
-        Start-Process -FilePath ".\oneapi_base.exe" -ArgumentList "--action install --silent --eula accept --components intel.oneapi.win.dpcpp-ct" -Wait
-        Remove-Item "oneapi_base.exe"
+      - name: Use oneAPI Installation Cache
+        uses: actions/cache@v5
+        id: cache-sycl
+        with:
+          path: ${{ env.ONEAPI_ROOT }}
+          key: oneAPI-${{ env.ONEAPI_INSTALLER_VERSION }}-${{ runner.os }}
 
-    - name: Configure CMake with SYCL Backend
-      run: |
-        # Source the Intel environment variables prior to generating the build matrix
-        cmd.exe /c "call `"${env:ProgramFiles(x86)}\Intel\oneAPI\setvars.bat`" && cmake -B build -G '"Visual Studio 17 2022"' -A x64 -DLLAMA_SYCL=ON -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }}"
+      - name: Download & Install oneAPI
+        shell: bash
+        if: steps.cache-sycl.outputs.cache-hit != 'true'
+        run: |
+          scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
 
-    - name: Execute Compilation
-      run: |
-        cmd.exe /c "call `"${env:ProgramFiles(x86)}\Intel\oneAPI\setvars.bat`" && cmake --build build --config ${{ github.event.inputs.build_type }} -j $env:NUMBER_OF_PROCESSORS"
+      - name: Install Level Zero SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ env.LEVEL_ZERO_SDK_URL }}" -OutFile "level-zero-win-sdk.zip"
+          Expand-Archive -Path "level-zero-win-sdk.zip" -DestinationPath "C:/level-zero-sdk" -Force
+          "LEVEL_ZERO_V1_SDK_PATH=C:/level-zero-sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: Compress and Stage Binaries
-      shell: powershell
-      run: |
-        New-Item -ItemType Directory -Path .\llama-sycl-windows-x64
-        Copy-Item -Path .\build\bin\${{ github.event.inputs.build_type }}\*.exe -Destination .\llama-sycl-windows-x64\
-        Copy-Item -Path .\build\bin\${{ github.event.inputs.build_type }}\*.dll -Destination .\llama-sycl-windows-x64\ -ErrorAction SilentlyContinue
-        Compress-Archive -Path .\llama-sycl-windows-x64\* -DestinationPath .\llama-sycl-windows-x64.zip
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-latest-sycl-ondemand
+          variant: ccache
+          evict-old-files: 1d
+          save: true # Force compilation updates to save back into cache for manually forced iterations
 
-    - name: Publish Downloadable Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: llama-sycl-windows-x64-${{ github.event.inputs.build_type }}
-        path: llama-sycl-windows-x64.zip
-        retention-days: 5
+      - name: Build
+        id: cmake_build
+        shell: bash
+        run: |
+          examples/sycl/win-build-sycl.bat
+
+      - name: Package and Compress Compiled Artifacts
+        shell: pwsh
+        run: |
+          # Create a isolated clean directory structure for distribution packaging
+          New-Item -ItemType Directory -Path .\llama-sycl-windows-bin
+          
+          # Upstream CMake targets often dump into build/bin/ or build/bin/Release depending on the generator used
+          # This safely checks both standard output variations to prevent file missing loops
+          if (Test-Path ".\build\bin\${{ github.event.inputs.build_type }}") {
+              $TargetSource = ".\build\bin\${{ github.event.inputs.build_type }}"
+          } elseif (Test-Path ".\build\bin") {
+              $TargetSource = ".\build\bin"
+          } else {
+              Write-Error "Could not isolate compilation execution output path context structure."
+              exit 1
+          }
+          
+          Write-Output "Staging artifacts from structural source path: $TargetSource"
+          
+          # Copy executables and dynamic shared libraries while suppressing error chains
+          Copy-Item -Path "$TargetSource\*.exe" -Destination .\llama-sycl-windows-bin\ -ErrorAction SilentlyContinue
+          Copy-Item -Path "$TargetSource\*.dll" -Destination .\llama-sycl-windows-bin\ -ErrorAction SilentlyContinue
+          
+          # Compress everything into a structural delivery asset zip archive
+          Compress-Archive -Path .\llama-sycl-windows-bin\* -DestinationPath .\llama-sycl-windows-bin.zip
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-bin-win-sycl-x64
+          path: llama-sycl-windows-bin.zip
+          retention-days: 7
