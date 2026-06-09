@@ -1,0 +1,61 @@
+name: Build llama.cpp with SYCL Support
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Allows you to manually trigger the build via GitHub UI
+
+jobs:
+  build-linux-sycl:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-tags: true
+
+    - name: Set up apt Repository for Intel oneAPI
+      run: |
+        wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.pub | gpg --dearmor | sudo tee /usr/share/keyrings/intel-sw-products.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/intel-sw-products.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+        sudo apt-get update
+
+    - name: Install Intel oneAPI Compiler & Essentials
+      run: |
+        sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel cmake build-essential
+
+    - name: Configure and Build llama.cpp with SYCL
+      run: |
+        # Source the Intel environment variables so the runner knows where icx/icpx are
+        source /opt/intel/oneapi/setvars.sh
+        
+        # Configure CMake using Intel compilers and enabling SYCL
+        cmake -B build \
+              -DCMAKE_C_COMPILER=icx \
+              -DCMAKE_CXX_COMPILER=icpx \
+              -DGGML_SYCL=ON \
+              -DGGML_SYCL_F16=ON \
+              -DCMAKE_BUILD_TYPE=Release
+        
+        # Build binaries
+        cmake --build build --config Release -j$(nproc)
+
+    - name: Package Binaries
+      run: |
+        mkdir llama-sycl-binaries
+        # Copy the main executables to our package folder
+        cp build/bin/llama-cli llama-sycl-binaries/
+        cp build/bin/llama-server llama-sycl-binaries/
+        # Check if the SYCL device lister tool compiled and include it
+        if [ -f build/bin/llama-ls-sycl-device ]; then cp build/bin/llama-ls-sycl-device llama-sycl-binaries/; fi
+
+    - name: Upload Build Artifacts
+      uses: actions/artifacts@v4
+      with:
+        name: llama-cpp-linux-sycl
+        path: llama-sycl-binaries/
+        retention-days: 5
